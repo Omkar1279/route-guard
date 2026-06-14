@@ -1,6 +1,8 @@
 # route-guard
 
-Deterministic, zero-LLM token budget governor for Claude Code. It routes tasks by prompt size, enforces route budgets, and blocks unnecessary delegation.
+Deterministic, zero-LLM token budget governor for Claude Code. Routes tasks by prompt size, enforces per-route token budgets, and blocks unnecessary subagent delegation.
+
+**Requirements:** Python 3.9+ (stdlib only — no pip, no virtualenv)
 
 ## Install
 
@@ -9,9 +11,40 @@ git clone https://github.com/Omkar1279/route-guard.git
 claude --plugin-dir ./route-guard
 ```
 
-Requires: Python 3.9+ (stdlib only).
+## How it works
 
-## Blocked spawn output
+Three Claude Code hooks fire on every turn:
+
+| Hook | Trigger | Action |
+|---|---|---|
+| `user_prompt_submit` | New prompt | Classifies by length → sets route + budget |
+| `pre_tool_use` | Task/Agent spawn | Checks spawn cap + budget; exits 2 to block |
+| `post_tool_use` | Any tool | Records tokens + file edits; auto-escalates route |
+
+State is persisted at `.claude/.route-guard-state.json` per workspace (written atomically, directory-lock safe for concurrent hooks).
+
+## Routes
+
+Routing is length-based: prompts under 80 chars → `small`, 80+ chars → `medium`. Auto-escalation promotes the route when thresholds are exceeded mid-turn.
+
+| Route | Token budget | Max spawns | Escalates from |
+|---|---:|---:|---|
+| trivial | 10 000 | 0 | — |
+| small | 40 000 | 0 | trivial (>120% budget or >5 file edits) |
+| medium | 120 000 | 2 | small (>120% budget) |
+| large | 250 000 | 5 | — |
+
+## Spawn gating rules
+
+A `Task` or `Agent` spawn is blocked (exit code 2) when any of these are true:
+
+- Route has `max_spawns: 0`
+- Spawn cap for the route is already reached
+- Token usage exceeds 85% of route budget
+- Token usage exceeds 70% of route budget **and** the subagent prompt is >1000 chars
+- Subagent prompt is non-empty but under 200 chars (delegation overkill)
+
+Blocked output:
 
 ```json
 {
@@ -27,34 +60,36 @@ Requires: Python 3.9+ (stdlib only).
 }
 ```
 
-## Routes
+## Implementation
 
-| Level | Budget | Max spawns |
-|---|---:|---:|
-| trivial | 10000 | 0 |
-| small | 40000 | 0 |
-| medium | 120000 | 2 |
-| large | 250000 | 5 |
+Pure Python, zero dependencies. Each hook is a 5-line shell shim that calls:
 
-## How it works
+```bash
+PYTHONPATH="$PLUGIN_ROOT" python3 -m route_guard.cli <verb>
+```
 
-1. UserPromptSubmit: resets turn, classifies prompt by length, writes route state, returns route context.
-2. PreToolUse (Task|Agent): applies deterministic spawn gating rules and blocks with exit code 2 when needed.
-3. PostToolUse: records token usage and file edits, escalates route when thresholds are exceeded.
+Package layout:
 
-State is stored at .claude/.route-guard-state.json per workspace.
+```
+route_guard/
+├── cli.py         # stdin → dispatch → stdout/stderr + exit code
+├── router.py      # prompt classification + state update
+├── classifier.py  # length-based route decision
+├── budget.py      # spawn gating, token recording, escalation
+└── state.py       # atomic JSON read/write with directory lock
+```
 
 ## Configuration
 
-`config.json`:
+`config.json` — edit to tune budgets or spawn caps:
 
 ```json
 {
   "routes": {
     "trivial": { "budget": 10000, "max_spawns": 0 },
-    "small": { "budget": 40000, "max_spawns": 0 },
-    "medium": { "budget": 120000, "max_spawns": 2 },
-    "large": { "budget": 250000, "max_spawns": 5 }
+    "small":   { "budget": 40000, "max_spawns": 0 },
+    "medium":  { "budget": 120000, "max_spawns": 2 },
+    "large":   { "budget": 250000, "max_spawns": 5 }
   }
 }
 ```
@@ -62,7 +97,7 @@ State is stored at .claude/.route-guard-state.json per workspace.
 ## Development
 
 ```bash
-pytest tests/                      # Unit tests
-claude plugin validate ./          # Validate plugin structure
-claude --plugin-dir ./             # Load locally
+pytest tests/                   # 16 unit + integration tests
+claude plugin validate ./       # validate plugin structure
+claude --plugin-dir ./          # load locally
 ```
