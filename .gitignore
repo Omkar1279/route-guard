@@ -8,7 +8,6 @@
 docs/
 
 # Excluded files
-PYTHON_PORT.md
 .venv/
 
 # Python
