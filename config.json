@@ -1,0 +1,8 @@
+{
+  "routes": {
+    "trivial": { "budget": 10000, "max_spawns": 0 },
+    "small": { "budget": 40000, "max_spawns": 0 },
+    "medium": { "budget": 120000, "max_spawns": 2 },
+    "large": { "budget": 250000, "max_spawns": 5 }
+  }
+}
