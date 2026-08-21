@@ -1,7 +1,7 @@
 {
   "name": "route-guard",
   "description": "Deterministic token budget governor and route-aware task sizing for Claude Code",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "author": { "name": "Omkar", "url": "https://github.com/Omkar1279" },
   "license": "MIT",
   "keywords": ["governance", "subagent", "token-budget", "hooks", "cost-control"],

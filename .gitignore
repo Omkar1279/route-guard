@@ -1,7 +1,5 @@
-# Runtime state (per-project, generated at runtime)
-.claude/.route-guard-state.json
-.claude/.route-guard-state.json.lock/
-.claude/.route-guard-state.json.tmp.*
+# Runtime state (per-session, generated at runtime)
+.claude/route-guard/
 
 # Local dev settings (user-specific, never commit)
 .claude/settings.local.json

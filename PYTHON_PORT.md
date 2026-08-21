@@ -1,198 +1,186 @@
-# Route-Guard — Python Implementation
+# Route-Guard — Implementation Notes
 
-> Stdlib-only Python 3.9+ rewrite of the original Node/JS plugin. Hook contract with Claude Code is unchanged — only the implementation language changed.
-
----
-
-## Layout
-
-```
-route-guard/
-├── .claude-plugin/plugin.json
-├── hooks/
-│   ├── hooks.json
-│   ├── user_prompt_submit.sh    # shim → python3 -m route_guard.cli user_prompt_submit
-│   ├── pre_tool_use.sh          # shim → python3 -m route_guard.cli pre_tool_use
-│   └── post_tool_use.sh         # shim → python3 -m route_guard.cli post_tool_use
-├── route_guard/
-│   ├── __init__.py
-│   ├── cli.py        # stdin → dispatch → stdout/stderr + exit code
-│   ├── router.py     # prompt classification + state update
-│   ├── classifier.py # length-based route decision
-│   ├── budget.py     # spawn gating, token recording, escalation
-│   └── state.py      # atomic JSON read/write with directory lock
-├── tests/
-│   ├── __init__.py
-│   └── test_governor.py   # 16 pytest cases
-├── config.json
-├── README.md
-├── LICENSE
-└── .gitignore
-```
-
-**Note on structure:** The plan originally specified a single flat `route_guard.py`. The actual implementation uses a package. At ~250 LOC the split does add `PYTHONPATH` in each shim and an `__init__.py`, but it makes individual modules independently testable and keeps each concern in one place.
+> Design reference for the Python implementation. Records the Claude Code hook
+> contract the plugin depends on, and the decisions behind the current design.
+> User-facing behaviour lives in [README.md](README.md).
 
 ---
 
-## Hook shims
+## The hook contract
 
-All three collapse to the same 6-line pattern:
+These were verified against the zod schemas embedded in the Claude Code binary
+(v2.1.220), not from documentation — the published docs disagreed with the binary
+on three of the four points below, and the binary won each time.
 
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-PLUGIN_ROOT="$( dirname "$DIR" )"
-PYTHONPATH="$PLUGIN_ROOT" exec python3 -m route_guard.cli <verb>
-```
+### Input
 
-Verbs: `user_prompt_submit`, `pre_tool_use`, `post_tool_use`.
-
-`hooks/hooks.json` is unchanged — still points at the three shims; `PreToolUse` matcher stays `"Task|Agent"`.
-
----
-
-## Modules
-
-### `state.py`
-
-- `set_workspace_root(cwd)` / `state_path()` → `.claude/.route-guard-state.json`
-- `read_state()` — JSON parse + merge with `DEFAULT_STATE` to tolerate schema drift
-- `write_state(state)` — atomic via temp file + `Path.replace()`
-- `with_state(fn)` — RMW with directory lock
-- `reset_turn(state)` — bumps `turn_number`, zeros per-turn counters
-- `acquire_lock()` / `release_lock()` — mkdir-based with PID file and 5 s stale detection
-
-```python
-DEFAULT_STATE = {
-    "current_route": None,
-    "route_reason": None,
-    "route_budget": None,
-    "turn_number": 0,
-    "cumulative_tokens_this_turn": 0,
-    "route_tokens_used": 0,
-    "spawns_attempted": 0,
-    "file_edits_this_turn": 0,
-    "escalations": [],
-}
-```
-
-### `classifier.py`
-
-Length-only routing — keyword matching dropped entirely:
-
-```python
-_LENGTH_THRESHOLD = 80
-
-def classify(prompt: str) -> dict[str, str]:
-    if len(prompt) < _LENGTH_THRESHOLD:
-        return {"route": "small", "reason": f"Prompt under {_LENGTH_THRESHOLD} chars."}
-    return {"route": "medium", "reason": f"Prompt {_LENGTH_THRESHOLD}+ chars."}
-```
-
-### `budget.py`
-
-Constants (formerly config knobs):
-
-```python
-ESCALATION_THRESHOLD = 1.2
-BUDGET_WARN_THRESHOLD = 0.85
-BUDGET_DELEGATION_THRESHOLD = 0.70
-MIN_SUBAGENT_PROMPT_LENGTH = 200
-ROUTE_ORDER = ['trivial', 'small', 'medium', 'large']
-```
-
-`evaluate_spawn(state, tool_input, config)` — blocks a spawn when any of these hold:
-- `max_spawns == 0`
-- `spawns_attempted >= max_spawns`
-- tokens used > 85% of budget
-- tokens used > 70% of budget **and** subagent prompt > 1000 chars
-- subagent prompt is non-empty but < 200 chars
-
-`check_escalation(state, config)` — fires after every tool call:
-- `trivial` or `small`: escalate to next route when tokens > 120% of budget
-- `trivial`: also escalate to `small` when `file_edits_this_turn > 5`
-- `medium` and above: no token-based auto-escalation
-
-`increment_file_edits(tool_name)` — increments `file_edits_this_turn` for write tools (`Write`, `Edit`, `NotebookEdit`, etc.).
-
-### `router.py`
-
-`process_prompt(prompt, config)` — resets turn, classifies, writes state, returns:
+Every hook receives a common envelope:
 
 ```
-<route-guard>
-[Route: SMALL | Budget: 40000 tokens | Agents: blocked]
-</route-guard>
+session_id, transcript_path, cwd, prompt_id?, permission_mode?, agent_id?, agent_type?
 ```
 
-### `cli.py`
+Plus per-event fields:
 
-Reads stdin once, parses JSON, dispatches on `argv[1]`. Any unhandled exception logs to stderr and exits 0 (degrade gracefully, never block Claude Code).
+| Event | Adds |
+|---|---|
+| `UserPromptSubmit` | `prompt`, `session_title?` |
+| `PreToolUse` | `tool_name`, `tool_input`, `tool_use_id` |
+| `PostToolUse` | `tool_name`, `tool_input`, `tool_response`, `tool_use_id`, `duration_ms?` |
 
----
+**There is no `usage` field on any hook event.** Token counts must come from the
+transcript. `agent_id` is present only when the hook fires inside a subagent.
 
-## Config
+### Output
+
+Output nests under `hookSpecificOutput`, and **`hookEventName` is required** — it
+is the discriminator of a union type, so an entry without it is dropped silently
+rather than rejected loudly:
 
 ```json
 {
-  "routes": {
-    "trivial": { "budget": 10000, "max_spawns": 0 },
-    "small":   { "budget": 40000, "max_spawns": 0 },
-    "medium":  { "budget": 120000, "max_spawns": 2 },
-    "large":   { "budget": 250000, "max_spawns": 5 }
+  "hookSpecificOutput": {
+    "hookEventName": "UserPromptSubmit",
+    "additionalContext": "..."
   }
 }
 ```
 
-**Removed from original config:**
-
-| Key | Reason |
+| Event | Accepts |
 |---|---|
-| `$schema` / `config.schema.json` | No runtime validation needed |
-| `routes.*.allow_agents` | Derived from `max_spawns > 0` |
-| `routes.*.description` | Unused in code |
-| `routes.exploratory` | Orphaned — no escalation path |
-| `agent_tools` | `hooks.json` matcher is single source of truth |
-| `route_order` | Hardcoded as `ROUTE_ORDER` in `budget.py` |
-| `escalation_threshold` | Module constant |
-| `budget_warn_threshold` | Module constant |
-| `budget_delegation_threshold` | Module constant |
-| `min_subagent_prompt_length` | Module constant |
+| `UserPromptSubmit` | `additionalContext`, `sessionTitle`, `suppressOriginalPrompt` |
+| `PreToolUse` | `permissionDecision`, `permissionDecisionReason`, `updatedInput`, `additionalContext` |
+| `PostToolUse` | `additionalContext`, `updatedToolOutput`, `updatedMCPToolOutput` |
 
-**`trivial` route kept** — the original plan called for removing it, but the file-edits escalation rule (`trivial` → `small` on >5 file edits) was kept, so `trivial` remains a valid route.
+There is **no top-level `additionalContext`** in the output schema. The top level
+accepts only `continue`, `suppressOutput`, `stopReason`, `decision`,
+`systemMessage`, `terminalSequence`, `reason`, and `hookSpecificOutput`.
+
+Denials use `permissionDecision: "deny"` with exit code 0, which delivers a
+structured reason to Claude. Exit code 2 also blocks but only surfaces raw stderr.
+
+### Plugin hook registration
+
+`hooks/hooks.json` is auto-discovered at the plugin root. In a hook entry
+`command` is a **string**, never an array. Exec form is `command` plus an `args`
+array, which spawns the executable directly with no shell — the safe way to pass
+`${CLAUDE_PLUGIN_ROOT}`, since placeholders are substituted per element:
+
+```json
+{ "type": "command", "command": "bash", "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/pre_tool_use.sh"] }
+```
 
 ---
 
-## What was cut vs. the JS original
+## Token accounting
 
-| Cut | Applied |
-|---|---|
-| `bin/` CLI integration tests | Yes — `test/integration.test.js` deleted |
-| `force_route` machinery | Yes — no escape hatch |
-| `strict_mode` | Yes |
-| `<cc-route>` self-classification protocol | Yes — `parseRouteTag`, `scrape*`, `markFallbackIfNeeded`, directive prose, SKILL.md |
-| `exploratory` route | Yes |
-| `session_budget` / `session_tokens_used` | Yes |
-| `spawns_blocked` counter | Yes |
-| `VALID_ROUTES` | Yes — `validate.js` deleted entirely |
-| Lock busy-spin | Yes — replaced with `time.sleep` |
-| `config.schema.json` | Yes |
-| Config slimmed to budget + max_spawns | Yes |
-| Length-only classifier | Yes |
-| `sanitizeString` | Yes |
-| SKILL.md | Yes |
-| Keywords list trimmed (15 → 5) | Yes |
-| `trivial` route removal | **No** — kept; file-edits escalation rule retained |
-| `file_edits_this_turn` removal | **No** — kept; still drives trivial→small escalation |
-| Single flat script (vs. package) | **No** — implemented as `route_guard/` package |
+`transcript.py` reads the session JSONL at `transcript_path`. Three properties of
+that file shape the implementation:
+
+1. **A single API response spans several lines** — one per content block — and each
+   line repeats the *same* `message.usage`. Observed at 2–3 lines per response in
+   practice. Entries are deduplicated by `message.id` (falling back to `requestId`,
+   then `uuid`); without this, counts inflate 2–3×.
+2. **`cache_read_input_tokens` re-counts the whole conversation** on every turn, so
+   it is excluded from turn cost. Turn cost is `input + cache_creation + output`.
+   Cache reads are reported separately as `context_tokens`.
+3. **Subagent work is not in this file** — it has its own transcript. Sidechain
+   entries are skipped, and `PostToolUse` accounting is skipped entirely when
+   `agent_id` is present.
+
+Usage is **recomputed** from scratch on each `PostToolUse` rather than accumulated.
+This makes the hook idempotent: a replayed or duplicated event cannot inflate the
+count, and a missed event self-heals on the next tool call.
+
+The turn boundary is `turn_started_at`, an ISO timestamp stamped at
+`UserPromptSubmit`. When it is absent — a resumed session, or a `PostToolUse` that
+arrives before any prompt — accounting **fails closed at zero** rather than
+charging an entire transcript to the current turn.
+
+Parsing is a full-file scan with a substring prefilter before `json.loads`;
+a real ~66-line transcript parses in ~1 ms. Tail-seeking was rejected: it buys a
+partial-first-line bug and undercounts long turns for no measurable saving.
+
+---
+
+## State
+
+One file per session at `.claude/route-guard/<session-id>.json`. Session scoping
+keeps two Claude Code sessions in the same repo from clobbering each other, and
+stops stale state from a previous session leaking into a new one.
+
+```python
+DEFAULT_STATE = {
+    'session_id': None,
+    'turn_number': 0,
+    'turn_started_at': None,   # ISO8601; the turn boundary for token accounting
+    'current_route': None,
+    'route_reason': None,
+    'route_budget': 0,
+    'tokens_this_turn': 0,     # input + cache_creation + output, this turn
+    'context_tokens': 0,       # live context size, including cache reads
+    'spawns_used': 0,          # allowed spawns; counts against max_spawns
+    'spawns_blocked': 0,       # denied spawns; does not count against the cap
+    'file_edits_this_turn': 0,
+    'escalations': [],
+}
+```
+
+Writes go through `with_state(fn)`: read-modify-write under a mkdir-based
+directory lock, then an atomic `Path.replace()`. Escalation runs inside that same
+transaction rather than writing a stale snapshot back over concurrent updates.
+
+---
+
+## Design decisions
+
+**Four length tiers, not two.** Length-only routing previously used a single
+80-char threshold, which made `trivial` and `large` unreachable — two of the four
+configured routes were dead. Tiers at 120 / 400 / 1200 chars make all four live.
+
+**An explicit `[route:...]` override — a deliberate reversal.** An earlier revision
+removed the `force_route` escape hatch on purpose. It is back, because length
+cannot express intent: a short "audit the whole repo with subagents" lands in
+`trivial`, whose `max_spawns: 0` blocks exactly the work being asked for. No
+threshold tuning fixes an inverted signal. The override is the correction
+mechanism, which is why it is preferred over reintroducing keyword heuristics —
+those were already tried, trimmed 15 → 5, then dropped as untestable.
+
+**Escalation walks multiple tiers.** Previously only `trivial` and `small` escalated,
+one step at a time. Now any route below `large` promotes as far as the overrun
+requires, so a turn that blows through 200 k tokens lands on `large` immediately
+instead of crawling one tier per tool call. Removing the `medium`-and-above special
+case also removed a rule with no stated rationale.
+
+**Blocked spawns don't consume the cap.** `spawns_attempted` previously incremented
+only on success, making the name a lie. It is now split: `spawns_used` gates the
+cap, `spawns_blocked` is reporting only. Otherwise two rejected short prompts would
+permanently exhaust a `max_spawns: 2` route.
+
+**Hooks never fail the session.** Every handler catches its own exceptions and
+exits 0. A governor that crashes a user's session is worse than one that silently
+stops governing.
 
 ---
 
 ## Tests
 
 ```bash
-pytest tests/ -v    # 16 cases, all pass
+pytest tests/ -v    # 40 cases
 ```
 
-Coverage: classifier, all spawn-gating rules, escalation (token + file-edits), block message shape, escalation from/to correctness, turn reset, thread-safety of `with_state`, `process_prompt`, and end-to-end `pre_tool_use.sh` subprocess.
+Three layers:
+
+- **Unit** — classifier tiers and override, every spawn-gating rule, escalation
+  paths, state isolation per session, concurrent `with_state`, corrupt-state
+  recovery.
+- **Transcript** — `message.id` deduplication, cache-read exclusion, sidechain
+  skipping, the fail-closed path when the turn boundary is missing.
+- **Contract** — each hook shim is run as a subprocess and its stdout asserted to
+  carry the correct `hookSpecificOutput.hookEventName`. This layer exists because
+  the previous suite passed while encoding a hook contract that Claude Code was
+  silently discarding; green unit tests are not evidence the contract is right.
+
+Verified end-to-end against a live `claude --plugin-dir` session on Python 3.9 and
+3.12: directive injection, transcript-based token accounting, route escalation, and
+subagent denial all confirmed in a real session.
