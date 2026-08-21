@@ -20,7 +20,7 @@ claude --plugin-dir ./route-guard
 | Hook | Fires on | Action |
 |---|---|---|
 | `UserPromptSubmit` | Every prompt | Assigns a route, starts a new turn, injects the budget directive |
-| `PreToolUse` | `Task` / `Agent` | Allows or denies the spawn against the route's caps |
+| `PreToolUse` | `Task` / `Agent` | Allows, denies, or promotes the route to pay for the spawn |
 | `PostToolUse` | Every tool | Recomputes turn cost from the transcript; escalates the route if needed |
 
 State lives at `.claude/route-guard/<session-id>.json`, one file per session, written
@@ -30,7 +30,7 @@ atomically under a directory lock.
 
 Prompt length picks the starting route. All four are reachable:
 
-| Route | Prompt length | Token budget | Max spawns |
+| Route | Prompt length | Token budget | Budgeted spawns |
 |---|---|---:|---:|
 | trivial | < 120 chars | 10 000 | 0 |
 | small | < 400 chars | 40 000 | 0 |
@@ -46,11 +46,15 @@ its route explicitly, which overrides the length tier:
 
 ## Escalation
 
-After every tool call the route is re-checked against what the turn has actually
-spent. Exceeding **120 % of the budget** promotes the route — walking up as many
-tiers as the overrun requires, so a runaway turn lands on `large` in one step
-rather than crawling. A `trivial` turn is also promoted after more than 5 file
-edits. Each promotion is recorded in `escalations` and announced to Claude:
+The starting route is a guess; escalation is what corrects it, from observed
+behaviour rather than from a better guess. Three signals promote a route:
+
+- **token spend** over 120 % of budget — walking up as many tiers as the overrun
+  requires, so a runaway turn lands on `large` in one step rather than crawling
+- **more than 5 file edits** on a `trivial` turn
+- **a legitimate delegation** on a route that budgets no agents (see below)
+
+Each promotion is recorded in `escalations` and announced to Claude:
 
 ```
 [route-guard] Route escalated from "trivial" to "small". Token usage (15674)
@@ -61,13 +65,22 @@ exceeded 120% of the trivial budget (10000). New budget: 40000 tokens.
 
 ## Spawn gating
 
-A `Task` / `Agent` spawn is denied when any of these hold:
+Whether the delegation is worth doing at all is judged first, independent of route:
+a subagent prompt that is non-empty but under 200 chars is **denied as overkill**.
 
-- the route allows no agents (`max_spawns: 0`)
-- the spawn cap is already used up
-- turn cost is over 85 % of budget
-- turn cost is over 70 % of budget **and** the subagent prompt is > 1 000 chars
-- the subagent prompt is non-empty but under 200 chars (delegation overkill)
+`max_spawns: 0` then does not mean *"agents are forbidden here"* — it means *"this
+route doesn't budget for agents."* Since the route came from a guess about prompt
+length, a delegation that clears the bar above is treated as evidence the guess was
+wrong: the route is promoted to the cheapest one that does budget for agents, and
+the spawn is judged there. Setting `max_spawns: 0` on **every** route is a real
+decision and is honoured — nothing is promoted and all delegation is refused.
+
+The remaining rules apply at that effective route:
+
+- the spawn cap is used up → denied, and never promoted (asking for a third agent
+  on `medium` does not buy you `large`)
+- turn cost is over 85 % of budget → denied
+- turn cost is over 70 % of budget **and** the subagent prompt is > 1 000 chars → denied
 
 Denials return a structured reason, which Claude receives as the tool result:
 
@@ -145,7 +158,7 @@ session is worse than one that stops governing.
 ## Development
 
 ```bash
-pytest tests/                 # 40 unit, contract, and end-to-end tests
+pytest tests/                 # 46 unit, contract, and end-to-end tests
 claude plugin validate ./     # validate the plugin manifest
 claude --plugin-dir ./        # load locally
 ```

@@ -40,6 +40,17 @@ def route_config(config: dict[str, Any], route: Any) -> dict[str, Any]:
     return found if isinstance(found, dict) else {}
 
 
+def _first_route_allowing_agents(config: dict[str, Any], from_route: Any) -> Optional[str]:
+    try:
+        start = ROUTE_ORDER.index(from_route)
+    except ValueError:
+        start = 0
+    for candidate in ROUTE_ORDER[start:]:
+        if _as_int(route_config(config, candidate).get('max_spawns')) > 0:
+            return candidate
+    return None
+
+
 def evaluate_spawn(
     current_state: dict[str, Any], tool_input: dict[str, Any], config: dict[str, Any]
 ) -> dict[str, Any]:
@@ -50,12 +61,32 @@ def evaluate_spawn(
 
     prompt_len = len((tool_input or {}).get('prompt') or '')
     tokens_used = _as_int(current_state.get('tokens_this_turn'))
-    budget = _as_int(settings.get('budget'))
-    max_spawns = _as_int(settings.get('max_spawns'))
     spawns_used = _as_int(current_state.get('spawns_used'))
 
-    if max_spawns == 0:
-        return {'allowed': False, 'reason': f'Agents disallowed on "{route}" route.'}
+    # Judged first, and independent of route: a throwaway delegation must never
+    # be able to buy itself a promotion below.
+    if 0 < prompt_len < MIN_SUBAGENT_PROMPT_LENGTH:
+        return {
+            'allowed': False,
+            'reason': (
+                f'Delegation overkill: subagent prompt is only {prompt_len} chars '
+                f'(min {MIN_SUBAGENT_PROMPT_LENGTH}).'
+            ),
+        }
+
+    # A route budgeting no agents reflects a guess made from prompt length, not a
+    # decision about this delegation. Treat the request as evidence the guess was
+    # wrong and judge it at the cheapest route that does budget for agents. If the
+    # config gives no route any spawns, that is a real decision -- honour it.
+    promote_to = None
+    if _as_int(settings.get('max_spawns')) == 0:
+        promote_to = _first_route_allowing_agents(config, route)
+        if promote_to is None:
+            return {'allowed': False, 'reason': 'No configured route permits agents.'}
+        settings = route_config(config, promote_to)
+
+    budget = _as_int(settings.get('budget'))
+    max_spawns = _as_int(settings.get('max_spawns'))
 
     if spawns_used >= max_spawns:
         return {'allowed': False, 'reason': f'Spawn cap reached ({spawns_used}/{max_spawns}).'}
@@ -78,13 +109,11 @@ def evaluate_spawn(
             'reason': f'Delegation expensive at {pct}% budget with {prompt_len}-char prompt; do inline.',
         }
 
-    if 0 < prompt_len < MIN_SUBAGENT_PROMPT_LENGTH:
+    if promote_to:
         return {
-            'allowed': False,
-            'reason': (
-                f'Delegation overkill: subagent prompt is only {prompt_len} chars '
-                f'(min {MIN_SUBAGENT_PROMPT_LENGTH}).'
-            ),
+            'allowed': True,
+            'reason': f'Delegation is within the limits of the "{promote_to}" route.',
+            'promote_to': promote_to,
         }
 
     return {'allowed': True, 'reason': 'Within budget and spawn limits.'}
@@ -108,14 +137,27 @@ def build_block_reason(current_state: dict[str, Any], reason: str, config: dict[
     return json.dumps(payload, indent=2)
 
 
-def record_spawn(allowed: bool) -> dict[str, Any]:
-    field = 'spawns_used' if allowed else 'spawns_blocked'
+DELEGATION_PROMOTION_REASON = 'A subagent was requested on a route that budgets no agents.'
+
+
+def commit_spawn(result: dict[str, Any], config: dict[str, Any]) -> Optional[str]:
+    """Record a spawn decision, promoting the route if delegation forced it."""
+    notice: dict[str, str] = {}
+    allowed = bool(result.get('allowed'))
+    promote_to = result.get('promote_to') if allowed else None
 
     def _update(current_state: dict[str, Any]) -> dict[str, Any]:
+        field = 'spawns_used' if allowed else 'spawns_blocked'
         current_state[field] = _as_int(current_state.get(field)) + 1
+
+        if promote_to:
+            promoted = _promote(current_state, promote_to, DELEGATION_PROMOTION_REASON, config)
+            if promoted:
+                notice['text'] = promoted
         return current_state
 
-    return state.with_state(_update)
+    state.with_state(_update)
+    return notice.get('text')
 
 
 def record_tool_use(
@@ -181,13 +223,10 @@ def _pending_escalation(
     return None
 
 
-def _apply_escalation(current_state: dict[str, Any], config: dict[str, Any]) -> Optional[str]:
-    """Promote the route in place if this turn outgrew it. Returns a notice."""
-    pending = _pending_escalation(current_state, config)
-    if not pending:
-        return None
-
-    new_route, reason = pending
+def _promote(
+    current_state: dict[str, Any], new_route: str, reason: str, config: dict[str, Any]
+) -> Optional[str]:
+    """Move the route up in place and return the notice for Claude."""
     settings = route_config(config, new_route)
     if not settings:
         return None
@@ -214,6 +253,14 @@ def _apply_escalation(current_state: dict[str, Any], config: dict[str, Any]) -> 
     )
 
 
+def _apply_escalation(current_state: dict[str, Any], config: dict[str, Any]) -> Optional[str]:
+    """Promote the route in place if this turn outgrew it. Returns a notice."""
+    pending = _pending_escalation(current_state, config)
+    if not pending:
+        return None
+    return _promote(current_state, pending[0], pending[1], config)
+
+
 def check_escalation(config: dict[str, Any]) -> Optional[str]:
     """Standalone escalation check against the stored state."""
     notice: dict[str, str] = {}
@@ -231,8 +278,8 @@ def check_escalation(config: dict[str, Any]) -> Optional[str]:
 __all__ = [
     'build_block_reason',
     'check_escalation',
+    'commit_spawn',
     'evaluate_spawn',
-    'record_spawn',
     'record_tool_use',
     'route_config',
 ]

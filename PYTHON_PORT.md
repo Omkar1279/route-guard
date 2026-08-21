@@ -162,11 +162,34 @@ configured routes were dead. Tiers at 120 / 400 / 1200 chars make all four live.
 
 **An explicit `[route:...]` override — a deliberate reversal.** An earlier revision
 removed the `force_route` escape hatch on purpose. It is back, because length
-cannot express intent: a short "audit the whole repo with subagents" lands in
-`trivial`, whose `max_spawns: 0` blocks exactly the work being asked for. No
-threshold tuning fixes an inverted signal. The override is the correction
-mechanism, which is why it is preferred over reintroducing keyword heuristics —
-those were already tried, trimmed 15 → 5, then dropped as untestable.
+cannot express intent: a short "audit the whole repo" is a large job wearing a
+small prompt, and no threshold tuning fixes an inverted signal. The override is
+the correction mechanism, which is why it is preferred over reintroducing keyword
+heuristics — those were already tried, trimmed 15 → 5, then dropped as untestable.
+It states the budget up front, where the promotion rule below only reacts after
+the work has already started down the wrong route.
+
+**`max_spawns: 0` promotes rather than forbids.** The initial route is a guess from
+prompt length, and escalation already corrects that guess for every other decision —
+budgets, reporting, ceilings all self-heal from observed spend. The spawn gate was
+the one decision left permanently hostage to the guess: a legitimately large task
+phrased in 50 chars landed in `trivial` and could *never* delegate, no matter how
+justified. So a delegation request is now treated as a fourth behavioural signal,
+alongside token overrun and file edits, and promotes the route to the cheapest one
+that budgets for agents.
+
+Two things keep this from being a free pass. The overkill rule is evaluated
+**before** promotion, so a throwaway `"list files"` spawn is refused and buys
+nothing. And promotion only rescues the *"this route budgets no agents"* case —
+an exhausted cap is a plain denial, so asking for a third agent on `medium` does
+not escalate to `large`. Zeroing `max_spawns` on every route remains a genuine
+"no agents ever" switch, since there is then nothing to promote to.
+
+The alternative considered and rejected was an LLM classifier — as a skill (cannot
+work: the route must exist before the first tool call, and it lets the governed
+party set its own budget) or as a native `prompt` hook (workable, and genuinely
+non-circular since hooks fire independently of the model, but it trades the
+zero-LLM property for accuracy on a guess that escalation already corrects).
 
 **Escalation walks multiple tiers.** Previously only `trivial` and `small` escalated,
 one step at a time. Now any route below `large` promotes as far as the overrun
@@ -188,7 +211,7 @@ stops governing.
 ## Tests
 
 ```bash
-pytest tests/ -v    # 40 cases
+pytest tests/ -v    # 46 cases
 ```
 
 Three layers:

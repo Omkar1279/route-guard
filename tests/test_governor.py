@@ -148,11 +148,66 @@ def test_record_tool_use_is_idempotent(workspace: Path, config: dict) -> None:
 # --- spawn gating ----------------------------------------------------------
 
 
-def test_evaluate_spawn_blocks_on_small(workspace: Path, config: dict) -> None:
+def test_legitimate_spawn_promotes_a_route_that_budgets_no_agents(
+    workspace: Path, config: dict
+) -> None:
+    """A short prompt guessed 'small' must not permanently forbid real delegation."""
     current = {**state.DEFAULT_STATE, 'current_route': 'small'}
     result = budget.evaluate_spawn(current, {'prompt': 'a' * 250}, config)
+
+    assert result['allowed'] is True
+    assert result['promote_to'] == 'medium'
+
+
+def test_promotion_is_recorded_and_announced(workspace: Path, config: dict) -> None:
+    state.write_state({**state.DEFAULT_STATE, 'current_route': 'trivial'})
+    result = budget.evaluate_spawn(dict(state.read_state()), {'prompt': 'a' * 250}, config)
+    notice = budget.commit_spawn(result, config)
+
+    assert notice and 'escalated from "trivial" to "medium"' in notice
+
+    updated = state.read_state()
+    assert updated['current_route'] == 'medium'
+    assert updated['route_budget'] == 120000
+    assert updated['spawns_used'] == 1
+    assert updated['escalations'][-1]['to'] == 'medium'
+
+
+def test_throwaway_spawn_cannot_buy_a_promotion(workspace: Path, config: dict) -> None:
+    """The overkill rule is judged before promotion, so it can't be escaped."""
+    state.write_state({**state.DEFAULT_STATE, 'current_route': 'trivial'})
+    result = budget.evaluate_spawn(dict(state.read_state()), {'prompt': 'list files'}, config)
+    budget.commit_spawn(result, config)
+
     assert result['allowed'] is False
-    assert 'disallowed' in result['reason'].lower()
+    assert 'overkill' in result['reason'].lower()
+    assert state.read_state()['current_route'] == 'trivial'
+
+
+def test_promotion_does_not_lift_an_exhausted_cap(workspace: Path, config: dict) -> None:
+    """Asking for a third agent on medium is a cap denial, not a route to large."""
+    current = {**state.DEFAULT_STATE, 'current_route': 'medium', 'spawns_used': 2}
+    result = budget.evaluate_spawn(current, {'prompt': 'a' * 250}, config)
+
+    assert result['allowed'] is False
+    assert 'spawn cap' in result['reason'].lower()
+    assert 'promote_to' not in result
+
+
+def test_promotion_respects_a_config_that_forbids_all_agents(workspace: Path) -> None:
+    """Zeroing every max_spawns is a real decision and must be honoured."""
+    no_agents = {'routes': {name: {'budget': 10000, 'max_spawns': 0} for name in budget.ROUTE_ORDER}}
+    current = {**state.DEFAULT_STATE, 'current_route': 'trivial'}
+    result = budget.evaluate_spawn(current, {'prompt': 'a' * 250}, no_agents)
+
+    assert result['allowed'] is False
+    assert 'no configured route permits agents' in result['reason'].lower()
+
+
+def test_promotion_judges_budget_at_the_promoted_route(workspace: Path, config: dict) -> None:
+    """55k tokens blows the small budget but sits well inside medium's."""
+    current = {**state.DEFAULT_STATE, 'current_route': 'small', 'tokens_this_turn': 55000}
+    assert budget.evaluate_spawn(current, {'prompt': 'a' * 250}, config)['allowed'] is True
 
 
 def test_evaluate_spawn_allows_medium_within_limits(workspace: Path, config: dict) -> None:
@@ -169,8 +224,8 @@ def test_evaluate_spawn_blocks_at_spawn_cap(workspace: Path, config: dict) -> No
 
 def test_blocked_spawns_do_not_consume_the_cap(workspace: Path, config: dict) -> None:
     state.write_state({**state.DEFAULT_STATE, 'current_route': 'medium'})
-    budget.record_spawn(allowed=False)
-    budget.record_spawn(allowed=False)
+    budget.commit_spawn({'allowed': False}, config)
+    budget.commit_spawn({'allowed': False}, config)
 
     current = state.read_state()
     assert current['spawns_blocked'] == 2
@@ -364,7 +419,7 @@ def test_hook_pre_tool_use_denies_with_valid_contract(workspace: Path) -> None:
             'session_id': 'test-session',
             'cwd': str(workspace),
             'tool_name': 'Task',
-            'tool_input': {'prompt': 'x' * 300},
+            'tool_input': {'prompt': 'list files'},
         },
     )
     assert result.returncode == 0, result.stderr
@@ -376,6 +431,28 @@ def test_hook_pre_tool_use_denies_with_valid_contract(workspace: Path) -> None:
     reason = json.loads(emitted['permissionDecisionReason'])
     assert reason['blocked'] is True
     assert reason['route'] == 'small'
+    assert 'overkill' in reason['reason'].lower()
+
+
+def test_hook_pre_tool_use_announces_promotion(workspace: Path) -> None:
+    state.write_state({**state.DEFAULT_STATE, 'current_route': 'small', 'route_budget': 40000})
+
+    result = _run_hook(
+        'pre_tool_use',
+        {
+            'session_id': 'test-session',
+            'cwd': str(workspace),
+            'tool_name': 'Task',
+            'tool_input': {'prompt': 'x' * 300},
+        },
+    )
+    assert result.returncode == 0, result.stderr
+
+    emitted = json.loads(result.stdout)['hookSpecificOutput']
+    assert emitted['hookEventName'] == 'PreToolUse'
+    assert 'permissionDecision' not in emitted
+    assert 'escalated from "small" to "medium"' in emitted['additionalContext']
+    assert state.read_state()['current_route'] == 'medium'
 
 
 def test_hook_pre_tool_use_stays_silent_when_allowed(workspace: Path) -> None:

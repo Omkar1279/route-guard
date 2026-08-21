@@ -52,10 +52,9 @@ def _handle_pre_tool_use(data: dict[str, Any]) -> int:
     config = load_config()
     current = state.read_state()
     result = budget.evaluate_spawn(current, data.get('tool_input') or {}, config)
-    allowed = bool(result.get('allowed'))
-    budget.record_spawn(allowed)
+    notice = budget.commit_spawn(result, config)
 
-    if not allowed:
+    if not result.get('allowed'):
         _emit(
             'PreToolUse',
             permissionDecision='deny',
@@ -63,6 +62,9 @@ def _handle_pre_tool_use(data: dict[str, Any]) -> int:
                 current, result.get('reason', 'Blocked by route-guard.'), config
             ),
         )
+    elif notice:
+        # Allowed, but the route had to move to pay for it. Say so.
+        _emit('PreToolUse', additionalContext=notice)
     return 0
 
 
