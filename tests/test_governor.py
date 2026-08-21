@@ -132,16 +132,16 @@ def test_transcript_missing_file_is_not_fatal() -> None:
     assert transcript.read_usage('/nonexistent/path.jsonl', datetime.now(timezone.utc))['tokens'] == 0
 
 
-def test_sync_usage_is_idempotent(workspace: Path) -> None:
+def test_record_tool_use_is_idempotent(workspace: Path, config: dict) -> None:
     state.with_state(state.start_turn)
     when = datetime.now(timezone.utc) + timedelta(seconds=1)
     path = _write_transcript(
         workspace / 't.jsonl', [_assistant_line('msg_1', when, output_tokens=700)]
     )
 
-    budget.sync_usage(path)
+    budget.record_tool_use(path, 'Read', config)
     first = state.read_state()['tokens_this_turn']
-    budget.sync_usage(path)
+    budget.record_tool_use(path, 'Read', config)
     assert state.read_state()['tokens_this_turn'] == first == 700
 
 
@@ -253,11 +253,10 @@ def test_large_route_never_escalates(workspace: Path, config: dict) -> None:
     assert state.read_state()['current_route'] == 'large'
 
 
-def test_record_file_edit_only_counts_write_tools(workspace: Path) -> None:
+def test_record_tool_use_only_counts_write_tools(workspace: Path, config: dict) -> None:
     state.write_state(dict(state.DEFAULT_STATE))
-    assert budget.record_file_edit('Read') is None
-    budget.record_file_edit('Edit')
-    budget.record_file_edit('Write')
+    for tool in ('Read', 'Edit', 'Write', 'Bash'):
+        budget.record_tool_use(None, tool, config)
     assert state.read_state()['file_edits_this_turn'] == 2
 
 

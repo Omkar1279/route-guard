@@ -88,6 +88,12 @@ that file shape the implementation:
    entries are skipped, and `PostToolUse` accounting is skipped entirely when
    `agent_id` is present.
 
+Spawn gating deliberately does *not* skip on `agent_id`, because subagents share
+the parent's `session_id` and therefore the same state file. Confirmed live: a
+subagent that spawned a further subagent incremented the parent's counter to
+`spawns_used: 2`, so nested delegation is capped by the same ceiling rather than
+escaping it.
+
 Usage is **recomputed** from scratch on each `PostToolUse` rather than accumulated.
 This makes the hook idempotent: a replayed or duplicated event cannot inflate the
 count, and a missed event self-heals on the next tool call.
@@ -97,9 +103,25 @@ The turn boundary is `turn_started_at`, an ISO timestamp stamped at
 arrives before any prompt — accounting **fails closed at zero** rather than
 charging an entire transcript to the current turn.
 
-Parsing is a full-file scan with a substring prefilter before `json.loads`;
-a real ~66-line transcript parses in ~1 ms. Tail-seeking was rejected: it buys a
-partial-first-line bug and undercounts long turns for no measurable saving.
+Everything a completed tool call touches — token counts, the file-edit counter and
+the escalation check — happens in **one** `with_state` transaction, so each tool
+costs one lock cycle and one write rather than three. Reading `turn_started_at`
+inside that lock also stops a finished turn's count from landing on a freshly
+started one.
+
+Parsing is a full-file scan with a substring prefilter before `json.loads`.
+`PostToolUse` has no matcher, so this runs on every tool call and the cost was
+measured rather than assumed:
+
+| Transcript size | Scan |
+|---|---:|
+| 6.4 MB (largest real transcript on the dev machine) | 15 ms |
+| 49 MB (synthetic) | 59 ms |
+| 245 MB (synthetic) | 278 ms |
+
+The prefilter keeps this cheap enough that seeking to a stored byte offset would
+add a `/compact`-invalidation edge case for no useful gain. Tail-seeking was
+rejected outright: it buys a partial-first-line bug and undercounts long turns.
 
 ---
 

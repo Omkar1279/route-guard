@@ -72,10 +72,9 @@ def _handle_post_tool_use(data: dict[str, Any]) -> int:
         # Subagent tool calls bill against their own transcript, not this turn.
         return 0
 
-    budget.sync_usage(data.get('transcript_path'))
-    budget.record_file_edit(data.get('tool_name') or '')
-
-    notice = budget.check_escalation(load_config())
+    notice = budget.record_tool_use(
+        data.get('transcript_path'), data.get('tool_name') or '', load_config()
+    )
     if notice:
         _emit('PostToolUse', additionalContext=notice)
     return 0

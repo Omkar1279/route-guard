@@ -118,33 +118,34 @@ def record_spawn(allowed: bool) -> dict[str, Any]:
     return state.with_state(_update)
 
 
-def sync_usage(transcript_path: Optional[str]) -> dict[str, Any]:
-    """Recompute this turn's token usage from the transcript.
+def record_tool_use(
+    transcript_path: Optional[str], tool_name: str, config: dict[str, Any]
+) -> Optional[str]:
+    """Fold a completed tool call into the turn, in one state transaction.
 
-    Recomputing rather than accumulating makes the hook idempotent: a replayed or
-    duplicated PostToolUse event cannot inflate the count.
+    Recomputing usage rather than accumulating makes this idempotent: a replayed
+    or duplicated PostToolUse event cannot inflate the count. Reading the turn
+    boundary inside the lock keeps a finished turn's count from landing on a
+    freshly started one.
     """
-    current = state.read_state()
-    since = transcript.parse_timestamp(current.get('turn_started_at'))
-    usage = transcript.read_usage(transcript_path, since)
-
-    def _update(latest: dict[str, Any]) -> dict[str, Any]:
-        latest['tokens_this_turn'] = usage['tokens']
-        latest['context_tokens'] = usage['context']
-        return latest
-
-    return state.with_state(_update)
-
-
-def record_file_edit(tool_name: str) -> Optional[dict[str, Any]]:
-    if tool_name not in _FILE_EDIT_TOOLS:
-        return None
+    notice: dict[str, str] = {}
 
     def _update(current_state: dict[str, Any]) -> dict[str, Any]:
-        current_state['file_edits_this_turn'] = _as_int(current_state.get('file_edits_this_turn')) + 1
+        since = transcript.parse_timestamp(current_state.get('turn_started_at'))
+        usage = transcript.read_usage(transcript_path, since)
+        current_state['tokens_this_turn'] = usage['tokens']
+        current_state['context_tokens'] = usage['context']
+
+        if tool_name in _FILE_EDIT_TOOLS:
+            current_state['file_edits_this_turn'] = _as_int(current_state.get('file_edits_this_turn')) + 1
+
+        escalated = _apply_escalation(current_state, config)
+        if escalated:
+            notice['text'] = escalated
         return current_state
 
-    return state.with_state(_update)
+    state.with_state(_update)
+    return notice.get('text')
 
 
 def _token_escalation_target(route: str, tokens: int, config: dict[str, Any]) -> Optional[str]:
@@ -180,43 +181,47 @@ def _pending_escalation(
     return None
 
 
+def _apply_escalation(current_state: dict[str, Any], config: dict[str, Any]) -> Optional[str]:
+    """Promote the route in place if this turn outgrew it. Returns a notice."""
+    pending = _pending_escalation(current_state, config)
+    if not pending:
+        return None
+
+    new_route, reason = pending
+    settings = route_config(config, new_route)
+    if not settings:
+        return None
+
+    from_route = current_state.get('current_route')
+    current_state['current_route'] = new_route
+    current_state['route_budget'] = _as_int(settings.get('budget'))
+    current_state['route_reason'] = f'Escalated: {reason}'
+    current_state['escalations'].append(
+        {
+            'from': from_route,
+            'to': new_route,
+            'reason': reason,
+            'at_tokens': _as_int(current_state.get('tokens_this_turn')),
+            'timestamp': state.now_iso(),
+        }
+    )
+
+    max_spawns = _as_int(settings.get('max_spawns'))
+    agents = f'allowed (max {max_spawns})' if max_spawns > 0 else 'blocked'
+    return (
+        f'[route-guard] Route escalated from "{from_route}" to "{new_route}". '
+        f'{reason} New budget: {settings.get("budget")} tokens. Agents: {agents}.'
+    )
+
+
 def check_escalation(config: dict[str, Any]) -> Optional[str]:
-    """Promote the route if this turn outgrew it. Returns a notice for Claude."""
+    """Standalone escalation check against the stored state."""
     notice: dict[str, str] = {}
 
     def _update(current_state: dict[str, Any]) -> dict[str, Any]:
-        pending = _pending_escalation(current_state, config)
-        if not pending:
-            return current_state
-
-        new_route, reason = pending
-        settings = route_config(config, new_route)
-        if not settings:
-            return current_state
-
-        from_route = current_state.get('current_route')
-        current_state['current_route'] = new_route
-        current_state['route_budget'] = _as_int(settings.get('budget'))
-        current_state['route_reason'] = f'Escalated: {reason}'
-        current_state['escalations'].append(
-            {
-                'from': from_route,
-                'to': new_route,
-                'reason': reason,
-                'at_tokens': _as_int(current_state.get('tokens_this_turn')),
-                'timestamp': state.now_iso(),
-            }
-        )
-
-        agents = (
-            f'allowed (max {_as_int(settings.get("max_spawns"))})'
-            if _as_int(settings.get('max_spawns')) > 0
-            else 'blocked'
-        )
-        notice['text'] = (
-            f'[route-guard] Route escalated from "{from_route}" to "{new_route}". '
-            f'{reason} New budget: {settings.get("budget")} tokens. Agents: {agents}.'
-        )
+        escalated = _apply_escalation(current_state, config)
+        if escalated:
+            notice['text'] = escalated
         return current_state
 
     state.with_state(_update)
@@ -227,8 +232,7 @@ __all__ = [
     'build_block_reason',
     'check_escalation',
     'evaluate_spawn',
-    'record_file_edit',
     'record_spawn',
+    'record_tool_use',
     'route_config',
-    'sync_usage',
 ]
